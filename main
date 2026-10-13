@@ -1,0 +1,219 @@
+import os
+import sqlite3
+import uuid
+from contextlib import asynccontextmanager
+from datetime import date as date_type
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+DB_PATH = Path(__file__).resolve().parent / "inside_out.db"
+
+DEFAULT_ORIGINS = ",".join(
+    origin
+    for port in (5500, 5501, 5502, 8000)
+    for origin in (f"http://localhost:{port}", f"http://127.0.0.1:{port}")
+)
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS clients (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_id TEXT NOT NULL REFERENCES clients(id),
+    text TEXT NOT NULL,
+    date TEXT NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_client_date ON tasks(client_id, date);
+"""
+
+
+class TaskCreate(BaseModel):
+    text: str = Field(min_length=1, max_length=80)
+    date: date_type
+
+
+class TaskUpdate(BaseModel):
+    completed: bool
+
+
+def init_db() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript(SCHEMA)
+    conn.commit()
+    conn.close()
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def get_client_id(
+    db: sqlite3.Connection = Depends(get_db),
+    x_client_id: str = Header(alias="X-Client-ID"),
+) -> str:
+    try:
+        client_id = str(uuid.UUID(x_client_id))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=400, detail="ÐÐµÐºÐ¾ÑÑÐµÐºÑÐ½ÑÐ¹ Ð·Ð°Ð³Ð¾Ð»Ð¾Ð²Ð¾Ðº X-Client-ID")
+    db.execute(
+        "INSERT OR IGNORE INTO clients (id, created_at) VALUES (?, ?)",
+        (client_id, datetime.now(timezone.utc).isoformat()),
+    )
+    db.commit()
+    return client_id
+
+
+def task_json(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "text": row["text"],
+        "date": row["date"],
+        "completed": bool(row["completed"]),
+        "created_at": row["created_at"],
+    }
+
+
+def own_task(db: sqlite3.Connection, task_id: int, client_id: str) -> None:
+    row = db.execute(
+        "SELECT id FROM tasks WHERE id = ? AND client_id = ?", (task_id, client_id)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="ÐÐ°Ð´Ð°ÑÐ° Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½Ð°")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="Inside Out API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ORIGINS", DEFAULT_ORIGINS).split(","),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/api/tasks")
+def list_tasks(
+    date: str,
+    db: sqlite3.Connection = Depends(get_db),
+    client_id: str = Depends(get_client_id),
+):
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ÐÐ°ÑÐ° Ð´Ð¾Ð»Ð¶Ð½Ð° Ð±ÑÑÑ Ð² ÑÐ¾ÑÐ¼Ð°ÑÐµ YYYY-MM-DD")
+    rows = db.execute(
+        "SELECT * FROM tasks WHERE client_id = ? AND date = ? ORDER BY id",
+        (client_id, date),
+    ).fetchall()
+    return {"tasks": [task_json(row) for row in rows]}
+
+
+@app.post("/api/tasks", status_code=201)
+def create_task(
+    payload: TaskCreate,
+    db: sqlite3.Connection = Depends(get_db),
+    client_id: str = Depends(get_client_id),
+):
+    cur = db.execute(
+        "INSERT INTO tasks (client_id, text, date, completed, created_at) VALUES (?, ?, ?, 0, ?)",
+        (client_id, payload.text.strip(), payload.date.isoformat(), datetime.now(timezone.utc).isoformat()),
+    )
+    db.commit()
+    row = db.execute("SELECT * FROM tasks WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return {"task": task_json(row)}
+
+
+@app.patch("/api/tasks/{task_id}")
+def update_task(
+    task_id: int,
+    payload: TaskUpdate,
+    db: sqlite3.Connection = Depends(get_db),
+    client_id: str = Depends(get_client_id),
+):
+    own_task(db, task_id, client_id)
+    db.execute("UPDATE tasks SET completed = ? WHERE id = ?", (int(payload.completed), task_id))
+    db.commit()
+    row = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return {"task": task_json(row)}
+
+
+@app.delete("/api/tasks/{task_id}", status_code=204)
+def delete_task(
+    task_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    client_id: str = Depends(get_client_id),
+):
+    own_task(db, task_id, client_id)
+    db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    db.commit()
+
+
+WEEKDAY_LABELS = ["ÐÐ½", "ÐÑ", "Ð¡Ñ", "Ð§Ñ", "ÐÑ", "Ð¡Ð±", "ÐÑ"]
+
+
+@app.get("/api/stats/week")
+def week_stats(
+    date: str | None = None,
+    db: sqlite3.Connection = Depends(get_db),
+    client_id: str = Depends(get_client_id),
+):
+    if date is None:
+        target = date_type.today()
+    else:
+        try:
+            target = date_type.fromisoformat(date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="ÐÐ°ÑÐ° Ð´Ð¾Ð»Ð¶Ð½Ð° Ð±ÑÑÑ Ð² ÑÐ¾ÑÐ¼Ð°ÑÐµ YYYY-MM-DD")
+
+    monday = target - timedelta(days=target.weekday())
+    dates = [monday + timedelta(days=i) for i in range(7)]
+    rows = db.execute(
+        f"SELECT date, COUNT(*) AS total, SUM(completed) AS done FROM tasks"
+        f" WHERE client_id = ? AND date IN ({','.join('?' * 7)}) GROUP BY date",
+        (client_id, *[d.isoformat() for d in dates]),
+    ).fetchall()
+    stats = {row["date"]: (row["total"], row["done"] or 0) for row in rows}
+
+    days = []
+    for d in dates:
+        total, done = stats.get(d.isoformat(), (0, 0))
+        days.append(
+            {
+                "date": d.isoformat(),
+                "label": WEEKDAY_LABELS[d.weekday()],
+                "total": total,
+                "done": done,
+                "percent": round(done / total * 100) if total else 0,
+            }
+        )
+    return {"days": days}
+
+
+# Ð Ð°Ð·Ð´Ð°ÑÐ° ÑÑÐ¾Ð½ÑÐµÐ½Ð´Ð° (ÐºÐ¾ÑÐµÐ½Ñ ÑÐµÐ¿Ð¾Ð·Ð¸ÑÐ¾ÑÐ¸Ñ). ÐÐ¾Ð½ÑÐ¸ÑÑÐµÑÑÑ Ð¿Ð¾ÑÐ»Ðµ API-Ð¼Ð°ÑÑÑÑÑÐ¾Ð²,
+# ÑÑÐ¾Ð±Ñ /api/* Ð¸ /docs Ð¾Ð±ÑÐ°Ð±Ð°ÑÑÐ²Ð°Ð»Ð¸ÑÑ FastAPI.
+app.mount("/", StaticFiles(directory=Path(__file__).resolve().parent.parent, html=True), name="frontend")
