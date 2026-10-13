@@ -1,0 +1,204 @@
+const API_URL = "http://127.0.0.1:8000";
+
+// --- Анонимная сессия: client_id генерируется один раз и хранится в браузере ---
+let clientId = localStorage.getItem("client_id");
+if (!clientId) {
+    clientId = crypto.randomUUID();
+    localStorage.setItem("client_id", clientId);
+}
+
+async function api(path, options = {}) {
+    const res = await fetch(API_URL + path, {
+        ...options,
+        headers: {
+            "Content-Type": "application/json",
+            "X-Client-ID": clientId,
+            ...(options.headers || {}),
+        },
+    });
+    if (res.status === 204) return null;
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+        const detail = data.detail || res.statusText || "empty response";
+        const message = typeof detail === "string" ? detail : "Ошибка в данных запроса";
+        throw new Error(`HTTP ${res.status}: ${message}`);
+    }
+    return data;
+}
+
+function todayStr() {
+    return new Date().toLocaleDateString("sv");
+}
+
+function showError(err) {
+    const el = document.getElementById("form-error");
+    if (!el) return;
+    el.textContent = err.message || String(err);
+    setTimeout(() => { el.textContent = ""; }, 5000);
+}
+
+// --- План на день ---
+const dateInput = document.getElementById("pd");
+const form = document.getElementById("pf");
+const input = document.getElementById("pi");
+const listEl = document.getElementById("task-list");
+
+if (dateInput && !dateInput.value) {
+    dateInput.value = todayStr();
+}
+
+function renderTasks(tasks) {
+    listEl.innerHTML = "";
+    for (const task of tasks) {
+        const li = document.createElement("li");
+        li.className = "task-item" + (task.completed ? " done" : "");
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = task.completed;
+        checkbox.addEventListener("change", async () => {
+            try {
+                await api(`/api/tasks/${task.id}`, {
+                    method: "PATCH",
+                    body: JSON.stringify({ completed: checkbox.checked }),
+                });
+                await refresh();
+            } catch (err) {
+                checkbox.checked = !checkbox.checked;
+                showError(err);
+            }
+        });
+
+        const text = document.createElement("span");
+        text.className = "task-text";
+        text.textContent = task.text;
+
+        const del = document.createElement("button");
+        del.type = "button";
+        del.className = "task-delete";
+        del.textContent = "×";
+        del.title = "Удалить";
+        del.addEventListener("click", async () => {
+            try {
+                await api(`/api/tasks/${task.id}`, { method: "DELETE" });
+                await refresh();
+            } catch (err) {
+                showError(err);
+            }
+        });
+
+        li.append(checkbox, text, del);
+        listEl.appendChild(li);
+    }
+}
+
+async function loadTasks() {
+    const data = await api(`/api/tasks?date=${dateInput.value}`);
+    renderTasks(data.tasks);
+}
+
+async function loadWeekStats() {
+    const data = await api("/api/stats/week");
+    const days = document.querySelectorAll(".week-progress .day");
+    data.days.forEach((day, i) => {
+        const block = days[i];
+        if (!block) return;
+        block.querySelector(".fill").style.height = day.percent + "%";
+        block.querySelector(".percent").textContent = day.percent + "%";
+    });
+}
+
+async function refresh() {
+    await Promise.all([loadTasks(), loadWeekStats()]);
+}
+
+if (form) {
+    form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const text = input.value.trim();
+        if (!text) return;
+        try {
+            await api("/api/tasks", {
+                method: "POST",
+                body: JSON.stringify({ text, date: dateInput.value }),
+            });
+            input.value = "";
+            await refresh();
+        } catch (err) {
+            showError(err);
+        }
+    });
+}
+
+if (dateInput) {
+    dateInput.addEventListener("change", () => {
+        loadTasks().catch(showError);
+    });
+}
+
+// --- Фокус-таймер: 30 минут работы, 5 минут отдыха ---
+const WORK_SECONDS = 30 * 60;
+const REST_SECONDS = 5 * 60;
+
+const timerEl = document.getElementById("tt");
+const startBtn = document.getElementById("tg");
+const resetBtn = document.getElementById("tr");
+
+let phase = "work";
+let remaining = WORK_SECONDS;
+let ticking = null;
+
+function drawTimer() {
+    const m = String(Math.floor(remaining / 60)).padStart(2, "0");
+    const s = String(remaining % 60).padStart(2, "0");
+    timerEl.textContent = `${m}:${s}`;
+}
+
+function stopTimer() {
+    clearInterval(ticking);
+    ticking = null;
+    startBtn.textContent = "Старт";
+}
+
+function startTimer() {
+    startBtn.textContent = "Пауза";
+    ticking = setInterval(() => {
+        remaining -= 1;
+        if (remaining <= 0) {
+            if (phase === "work") {
+                phase = "rest";
+                remaining = REST_SECONDS;
+                alert("Время отдыха! 5 минут.");
+            } else {
+                phase = "work";
+                remaining = WORK_SECONDS;
+                alert("Отдых окончен, возвращаемся к работе.");
+            }
+        }
+        drawTimer();
+    }, 1000);
+}
+
+if (startBtn && resetBtn && timerEl) {
+    startBtn.addEventListener("click", () => {
+        if (ticking) {
+            stopTimer();
+        } else {
+            startTimer();
+        }
+    });
+
+    resetBtn.addEventListener("click", () => {
+        stopTimer();
+        phase = "work";
+        remaining = WORK_SECONDS;
+        drawTimer();
+    });
+
+    drawTimer();
+}
+
+// Первичная загрузка (только если на странице есть нужные элементы)
+if (listEl) {
+    refresh().catch(showError);
+}
