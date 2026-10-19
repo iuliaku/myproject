@@ -214,6 +214,4 @@ def week_stats(
     return {"days": days}
 
 
-# Ð Ð°Ð·Ð´Ð°ÑÐ° ÑÑÐ¾Ð½ÑÐµÐ½Ð´Ð° (ÐºÐ¾ÑÐµÐ½Ñ ÑÐµÐ¿Ð¾Ð·Ð¸ÑÐ¾ÑÐ¸Ñ). ÐÐ¾Ð½ÑÐ¸ÑÑÐµÑÑÑ Ð¿Ð¾ÑÐ»Ðµ API-Ð¼Ð°ÑÑÑÑÑÐ¾Ð²,
-# ÑÑÐ¾Ð±Ñ /api/* Ð¸ /docs Ð¾Ð±ÑÐ°Ð±Ð°ÑÑÐ²Ð°Ð»Ð¸ÑÑ FastAPI.
 app.mount("/", StaticFiles(directory=Path(__file__).resolve().parent.parent, html=True), name="frontend")
